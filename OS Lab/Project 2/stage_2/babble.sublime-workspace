@@ -1,0 +1,800 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+			[
+				"f",
+				"f_client"
+			],
+			[
+				"PRO",
+				"BABBLE_PRODCONS_SIZE"
+			],
+			[
+				"client",
+				"client_key"
+			],
+			[
+				"new",
+				"newsockfd"
+			],
+			[
+				"nb",
+				"nb_clients"
+			]
+		]
+	},
+	"buffers":
+	[
+		{
+			"file": "babble_client.c",
+			"settings":
+			{
+				"buffer_size": 4001,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "stress_test.c",
+			"settings":
+			{
+				"buffer_size": 8585,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "babble_client_implem.c",
+			"settings":
+			{
+				"buffer_size": 8227,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "babble_server.c",
+			"settings":
+			{
+				"buffer_size": 11372,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "#include <sys/socket.h>\n#include <netinet/in.h>\n#include <arpa/inet.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n#include <errno.h>\n#include <string.h>\n#include <sys/types.h>\n#include <time.h>\n#include <assert.h>\n\n#include \"babble_server.h\"\n#include \"babble_types.h\"\n#include \"babble_utils.h\"\n#include \"babble_communication.h\"\n#include \"babble_server_answer.h\"\n\n\nstatic void display_help(char *exec)\n{\n    printf(\"Usage: %s -p port_number\\n\", exec);\n}\n\n\nstatic int parse_command(char* str, command_t *cmd)\n{\n    char *name = NULL;\n    \n    /* start by cleaning the input */\n    str_clean(str);\n    \n    /* get command id */\n    cmd->cid=str_to_command(str, &cmd->answer_expected);\n    \n    switch(cmd->cid){\n    case LOGIN:\n        if(str_to_payload(str, cmd->msg, BABBLE_ID_SIZE)){\n            name = get_name_from_key(cmd->key);\n            fprintf(stderr,\"Error from [%s]-- invalid LOGIN -> %s\\n\", name, str);\n            free(name);\n            return -1;\n        }\n        break;\n    case PUBLISH:\n        if(str_to_payload(str, cmd->msg, BABBLE_SIZE)){\n            name = get_name_from_key(cmd->key);\n            fprintf(stderr,\"Warning from [%s]-- invalid PUBLISH -> %s\\n\", name, str);\n            free(name);\n            return -1;\n        }\n        break;\n    case FOLLOW:\n        if(str_to_payload(str, cmd->msg, BABBLE_ID_SIZE)){\n            name = get_name_from_key(cmd->key);\n            fprintf(stderr,\"Warning from [%s]-- invalid FOLLOW -> %s\\n\", name, str);\n            free(name);\n            return -1;\n        }\n        break;\n    case TIMELINE:\n        cmd->msg[0]='\\0';\n        break;\n    case FOLLOW_COUNT:\n        cmd->msg[0]='\\0';\n        break;\n    case RDV:\n        cmd->msg[0]='\\0';\n        break;    \n    default:\n        name = get_name_from_key(cmd->key);\n        fprintf(stderr,\"Error from [%s]-- invalid client command -> %s\\n\", name, str);\n        free(name);\n        return -1;\n    }\n\n    return 0;\n}\n\n\n/* processes the command and eventually generates an answer */\nstatic int process_command(command_t *cmd, answer_t **answer)\n{\n    int res=0;\n\n    switch(cmd->cid){\n    case LOGIN:\n        res = run_login_command(cmd, answer);\n        break;\n    case PUBLISH:\n        res = run_publish_command(cmd, answer);\n        break;\n    case FOLLOW:\n        res = run_follow_command(cmd, answer);\n        break;\n    case TIMELINE:\n        res = run_timeline_command(cmd, answer);\n        break;\n    case FOLLOW_COUNT:\n        res = run_fcount_command(cmd, answer);\n        break;\n    case RDV:\n        res = run_rdv_command(cmd, answer);\n        break;\n    default:\n        fprintf(stderr,\"Error -- Unknown command id\\n\");\n        return -1;\n    }\n\n    if(res){\n        fprintf(stderr,\"Error -- Failed to run command \");\n        display_command(cmd, stderr);\n    }\n\n    return res;\n}\n\nint main(int argc, char *argv[])\n{\n    int sockfd, newsockfd;\n    int portno=BABBLE_PORT;\n    \n    int opt;\n    int nb_args=1;\n    \n    char* recv_buff=NULL;\n    int recv_size=0;\n    \n    unsigned long client_key=0;\n    char client_name[BABBLE_ID_SIZE+1];\n\n    command_t *cmd;\n    answer_t *answer=NULL;\n    \n    while ((opt = getopt (argc, argv, \"+p:\")) != -1){\n        switch (opt){\n        case 'p':\n            portno = atoi(optarg);\n            nb_args+=2;\n            break;\n        case 'h':\n        case '?':\n        default:\n            display_help(argv[0]);\n            return -1;\n        }\n    }\n    \n    if(nb_args != argc){\n        display_help(argv[0]);\n        return -1;\n    }\n\n    server_data_init();    \n\n    if((sockfd = server_connection_init(portno)) == -1){\n        return -1;\n    }\n\n    printf(\"Babble server bound to port %d\\n\", portno);    \n    \n    /* main server loop */\n    while(1){\n        \n        if((newsockfd= server_connection_accept(sockfd))==-1){\n            return -1;\n        }\n\n        memset(client_name, 0, BABBLE_ID_SIZE+1);\n        if((recv_size = network_recv(newsockfd, (void**)&recv_buff)) < 0){//reads data from client\n            fprintf(stderr, \"Error -- recv from client\\n\");\n            close(newsockfd);\n            continue;\n        }\n\n        \n        cmd = new_command(0);\n    \n        if(parse_command(recv_buff, cmd) == -1 || cmd->cid != LOGIN){//checks cmd msg if correct\n            fprintf(stderr, \"Error -- in LOGIN message\\n\");\n            close(newsockfd);\n            free(cmd);\n            continue;\n        }\n\n        /* before processing the command, we should register the\n         * socket associated with the new client; this is to be done only\n         * for the LOGIN command */\n        cmd->sock = newsockfd;\n    \n        if(process_command(cmd, &answer) == -1){//process login command\n            fprintf(stderr, \"Error -- in LOGIN\\n\");\n            close(newsockfd);\n            free(cmd);\n            continue;\n        }\n        \n        /* notify client of registration */\n        if(send_answer_to_client(answer) == -1){\n            fprintf(stderr, \"Error -- in LOGIN ack\\n\");\n            close(newsockfd);\n            free(cmd);\n            free_answer(answer);\n            continue;\n        }\n        else{\n            free_answer(answer);\n        }\n        \n        /* let's store the key locally */\n        client_key = cmd->key;\n        \n        strncpy(client_name, cmd->msg, BABBLE_ID_SIZE);\n        free(recv_buff);\n        free(cmd);\n\n        /* looping on client commands */\n        while((recv_size=network_recv(newsockfd, (void**) &recv_buff)) > 0){\n            cmd = new_command(client_key);\n        \n            if(parse_command(recv_buff, cmd) == -1){//process further cmds from registered client\n                fprintf(stderr, \"Warning: unable to parse message from client %s\\n\", client_name);\n                notify_parse_error(cmd, recv_buff, &answer);\n                send_answer_to_client(answer);\n                free_answer(answer);\n                free(cmd);\n            }\n            else{\n                if(process_command(cmd, &answer) == -1){//run command\n                    fprintf(stderr, \"Warning: unable to process command from client %lu\\n\", cmd->key);\n                }\n                free(cmd);\n\n                if(send_answer_to_client(answer) == -1){\n                    fprintf(stderr, \"Warning: unable to answer command from client %lu\\n\", answer->key);\n                }\n                free_answer(answer);\n            }\n            free(recv_buff);\n        }\n        char msg[BABBLE_SIZE];\n        if(client_name[0] != 0){\n            cmd = new_command(client_key);\n            cmd->cid= UNREGISTER;\n            \n            if(unregisted_client(cmd)){\n                fprintf(stderr,\"Warning -- failed to unregister client %s\\n\",client_name);\n            }\n            free(cmd);\n        }\n    }\n    close(sockfd);\n    return 0;\n}",
+			"settings":
+			{
+				"buffer_size": 6784,
+				"line_ending": "Unix",
+				"name": "#include <sys/socket.h>"
+			}
+		},
+		{
+			"file": "babble_server_answer.h",
+			"settings":
+			{
+				"buffer_size": 1101,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "babble_types.h",
+			"settings":
+			{
+				"buffer_size": 1121,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "babble_utils.c",
+			"settings":
+			{
+				"buffer_size": 5592,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "babble_server_implem.c",
+			"settings":
+			{
+				"buffer_size": 12842,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "Searching 26 files for \"ERROR ->\"\n\n/home/vaynee/Desktop/lab7/stage_0/babble_server.run:\n    <binary>\n\n/home/vaynee/Desktop/lab7/stage_0/babble_server_implem.c:\n   53      \n   54      if(cmd->cid == LOGIN || cmd->cid == PUBLISH || cmd->cid == FOLLOW){\n   55:         snprintf(msg_buffer, BABBLE_BUFFER_SIZE,\"%s[%ld]: ERROR -> %d { %s } \\n\", client->client_name, time(NULL)-server_start, cmd->cid, cmd->msg);\n   56      }\n   57      else{\n   58:         snprintf(msg_buffer, BABBLE_BUFFER_SIZE,\"%s[%ld]: ERROR -> %d \\n\", client->client_name, time(NULL)-server_start, cmd->cid);\n   59  \n   60      }\n   ..\n  454          msg_buffer = malloc(BABBLE_BUFFER_SIZE);\n  455  \n  456:         snprintf(msg_buffer, BABBLE_BUFFER_SIZE,\"%s[%ld]: ERROR -> %s\\n\", client->client_name, time(NULL)-server_start, input);\n  457          \n  458          add_msg_to_answer(the_answer, BABBLE_BUFFER_SIZE, msg_buffer);\n\n6 matches across 2 files\n\n\nSearching 26 files for \"generate_cmd_error\"\n\n/home/vaynee/Desktop/lab7/stage_0/babble_server.run:\n    <binary>\n\n/home/vaynee/Desktop/lab7/stage_0/babble_server_implem.c:\n   34  \n   35  /* stores an error message in the answer_set of a command */\n   36: static void generate_cmd_error(command_t *cmd, answer_t **answer)\n   37  {\n   38      answer_t *the_answer=NULL;\n   ..\n   44  \n   45      if(client == NULL){\n   46:         fprintf(stderr, \"Error generate_cmd_error-- no client found\\n\");\n   47          return;\n   48      }\n   ..\n  201          timeline_free(client_data->timeline);\n  202          free(client_data);\n  203:         generate_cmd_error(cmd, answer);\n  204          return -1;\n  205      }\n  ...\n  238      if(client == NULL){\n  239          fprintf(stderr, \"Error run_publish_command-- no client found\\n\");\n  240:         generate_cmd_error(cmd,answer);\n  241          return -1;\n  242      }\n  ...\n  282      if(client == NULL){\n  283          fprintf(stderr, \"Error -- no client found\\n\");\n  284:         generate_cmd_error(cmd, answer);\n  285          return -1;\n  286      }\n  ...\n  293      \n  294      if(f_client == NULL){\n  295:         generate_cmd_error(cmd, answer);        \n  296          return 0;\n  297      }\n  ...\n  341      if(client == NULL){\n  342          fprintf(stderr, \"Error -- no client found\\n\");\n  343:         generate_cmd_error(cmd, answer);\n  344          return -1;\n  345      }\n  ...\n  363      if(client == NULL){\n  364          fprintf(stderr, \"Error -- no client found\\n\");\n  365:         generate_cmd_error(cmd, answer);\n  366          return -1;\n  367      }\n  ...\n  393      if(client == NULL){\n  394          fprintf(stderr, \"Error -- no client found\\n\");\n  395:         generate_cmd_error(cmd, answer);\n  396          return -1;\n  397      }\n\n12 matches across 2 files\n",
+			"settings":
+			{
+				"buffer_size": 2751,
+				"line_ending": "Unix",
+				"name": "Find Results",
+				"scratch": true
+			}
+		},
+		{
+			"file": "babble_registration.c",
+			"settings":
+			{
+				"buffer_size": 3635,
+				"encoding": "UTF-8",
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "babble_communication.c",
+			"settings":
+			{
+				"buffer_size": 2062,
+				"line_ending": "Unix"
+			}
+		}
+	],
+	"build_system": "",
+	"build_system_choices":
+	[
+	],
+	"build_varint": "",
+	"command_palette":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"console":
+	{
+		"height": 0.0,
+		"history":
+		[
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"expanded_folders":
+	[
+		"/home/vaynee/Desktop/lab7/stage_0"
+	],
+	"file_history":
+	[
+		"/home/vaynee/Desktop/lab7/stage_0/babble_registration.h",
+		"/home/vaynee/Desktop/lab7/stage_0/babble_config.h",
+		"/home/vaynee/Desktop/lab7/stage_0/babble_client.h",
+		"/home/vaynee/Desktop/lab7/stage_0/stress_test.c"
+	],
+	"find":
+	{
+		"height": 50.0
+	},
+	"find_in_files":
+	{
+		"height": 134.0,
+		"where_history":
+		[
+			""
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+			"buffer_count",
+			"generate_cmd_error",
+			"ERROR ->",
+			"ERROR -> 2",
+			"client_key",
+			"Error -- no client found",
+			"command_buffer",
+			"cmd->sock",
+			"\"cmd sock",
+			"Client exiting",
+			"ERROR receiving ack msg### Client exiting",
+			"recv_buff",
+			"client_name",
+			"process_command",
+			"run_publish_command",
+			"process_command",
+			"answer_t",
+			"send_answer_to_client",
+			"process_command",
+			"answer",
+			"client_key",
+			"input",
+			"pthread_mutex_lock",
+			"copy",
+			"while((recv_size=network_recv(newsockfd, (void**) ",
+			"executor_thread_func",
+			"if(pthread_",
+			"if(pthread_rwlock_unlock(&rwlock) != 0){",
+			"commun",
+			"comm",
+			"main",
+			"buffer",
+			"copy",
+			"buffer",
+			"in",
+			"fprintf(stderr, \"Warning: unable to process command from client %lu\\n\",cmd->key);",
+			"while((recv_size",
+			"answer_command",
+			"int answer_command",
+			"process_command",
+			"Error -- Failed to run command",
+			"communicator_thread_func",
+			"commu",
+			"comm",
+			"executor_thread_func",
+			"publish",
+			"client_name",
+			"comm",
+			"if(process_command(cmd, &answer) == -1){\n            fprintf(stderr, \"Error -- in LOGIN\\n\");",
+			"if(process_command(cmd, &answer) == -1){",
+			"LOGIN",
+			"received only",
+			"cmd",
+			"communicator_thread_func",
+			"registr",
+			"main",
+			"command_buffer",
+			"publish",
+			"registration_remove",
+			"writing to non existing client",
+			"received only",
+			"regis",
+			"notify_parse_error",
+			"regis",
+			"pthrea",
+			"registr",
+			"buffer",
+			"communicator_thread_func",
+			"executor_thread_func",
+			"registration_insert",
+			"run_login_command",
+			"server_connection_accept",
+			"connect\nconnect",
+			"res vsu",
+			"thread",
+			"received only",
+			"starting new client with id",
+			"str_to_command"
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"folders":
+	[
+		{
+			"path": "/home/vaynee/Desktop/lab7/stage_0"
+		}
+	],
+	"groups":
+	[
+		{
+			"selected": 3,
+			"sheets":
+			[
+				{
+					"buffer": 0,
+					"file": "babble_client.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 4001,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								743,
+								743
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 489.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 7,
+					"type": "text"
+				},
+				{
+					"buffer": 1,
+					"file": "stress_test.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 8585,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								7475,
+								7475
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 7046.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 11,
+					"type": "text"
+				},
+				{
+					"buffer": 2,
+					"file": "babble_client_implem.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 8227,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								5505,
+								5505
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 2522.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 6,
+					"type": "text"
+				},
+				{
+					"buffer": 3,
+					"file": "babble_server.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 11372,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								9950,
+								9950
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 10526.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 0,
+					"type": "text"
+				},
+				{
+					"buffer": 4,
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 6784,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								229,
+								229
+							]
+						],
+						"settings":
+						{
+							"auto_name": "#include <sys/socket.h>",
+							"syntax": "Packages/Text/Plain text.tmLanguage",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 1,
+					"type": "text"
+				},
+				{
+					"buffer": 5,
+					"file": "babble_server_answer.h",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 1101,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								704,
+								704
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.sublime-syntax"
+						},
+						"translation.x": 0.0,
+						"translation.y": 170.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 8,
+					"type": "text"
+				},
+				{
+					"buffer": 6,
+					"file": "babble_types.h",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 1121,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1113,
+								1113
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 721.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 4,
+					"type": "text"
+				},
+				{
+					"buffer": 7,
+					"file": "babble_utils.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 5592,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								4360,
+								4360
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 4980.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 10,
+					"type": "text"
+				},
+				{
+					"buffer": 8,
+					"file": "babble_server_implem.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 12842,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								7904,
+								7904
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 7920.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 3,
+					"type": "text"
+				},
+				{
+					"buffer": 9,
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 2751,
+						"regions":
+						{
+							"match":
+							{
+								"flags": 112,
+								"regions":
+								[
+									[
+										316,
+										324
+									],
+									[
+										502,
+										510
+									],
+									[
+										732,
+										740
+									],
+									[
+										1189,
+										1207
+									],
+									[
+										1373,
+										1391
+									],
+									[
+										1559,
+										1577
+									],
+									[
+										1764,
+										1782
+									],
+									[
+										1949,
+										1967
+									],
+									[
+										2087,
+										2105
+									],
+									[
+										2280,
+										2298
+									],
+									[
+										2466,
+										2484
+									],
+									[
+										2652,
+										2670
+									]
+								],
+								"scope": ""
+							}
+						},
+						"selection":
+						[
+							[
+								2106,
+								2106
+							]
+						],
+						"settings":
+						{
+							"detect_indentation": false,
+							"line_numbers": false,
+							"output_tag": 2,
+							"result_base_dir": "",
+							"result_file_regex": "^([^ \t].*):$",
+							"result_line_regex": "^ +([0-9]+):",
+							"scroll_past_end": true,
+							"syntax": "Packages/Default/Find Results.hidden-tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 1363.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 5,
+					"type": "text"
+				},
+				{
+					"buffer": 10,
+					"file": "babble_registration.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 3635,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1681,
+								1681
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 2,
+					"type": "text"
+				},
+				{
+					"buffer": 11,
+					"file": "babble_communication.c",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 2062,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1414,
+								1414
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C.sublime-syntax",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 1736.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 9,
+					"type": "text"
+				}
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 38.0
+	},
+	"input":
+	{
+		"height": 0.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"output.find_results":
+	{
+		"height": 0.0
+	},
+	"pinned_build_system": "",
+	"project": "",
+	"replace":
+	{
+		"height": 72.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"selected_group": 0,
+	"settings":
+	{
+	},
+	"show_minimap": true,
+	"show_open_files": false,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 261.0,
+	"status_bar_visible": true,
+	"template_settings":
+	{
+	}
+}
